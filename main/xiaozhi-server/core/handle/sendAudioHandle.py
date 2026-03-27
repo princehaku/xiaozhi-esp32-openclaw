@@ -8,6 +8,7 @@ if TYPE_CHECKING:
 from core.utils import textUtils
 from core.utils.util import audio_to_data
 from core.providers.tts.dto.dto import SentenceType
+from core.handle.reportHandle import enqueue_perf_report
 from core.utils.audioRateController import AudioRateController
 
 TAG = __name__
@@ -15,6 +16,55 @@ TAG = __name__
 AUDIO_FRAME_DURATION = 60
 # 预缓冲包数量，直接发送以减少延迟
 PRE_BUFFER_COUNT = 5
+
+
+def _get_pre_buffer_count(conn: "ConnectionHandler"):
+    configured_value = conn.config.get("tts_pre_buffer_count")
+    if configured_value is None:
+        mode = str(conn.config.get("tts_sentence_mode", "natural")).lower()
+        configured_value = 3 if mode == "aggressive" else PRE_BUFFER_COUNT
+    try:
+        pre_buffer_count = int(configured_value)
+    except (TypeError, ValueError):
+        pre_buffer_count = PRE_BUFFER_COUNT
+    return max(1, min(pre_buffer_count, 10))
+
+
+def _build_performance_payload(conn: "ConnectionHandler", stage: str):
+    marks = getattr(conn, "latency_marks", {}) or {}
+    asr_end_ms = marks.get("asr_end_ms")
+    llm_first_token_ms = marks.get("llm_first_token_ms")
+    tts_first_audio_packet_ms = marks.get("tts_first_audio_packet_ms")
+    now_ms = time.time() * 1000
+
+    return {
+        "type": "performance",
+        "stage": stage,
+        "session_id": conn.session_id,
+        "metrics": {
+            "asr_end_ms": asr_end_ms,
+            "llm_first_token_ms": llm_first_token_ms,
+            "tts_first_audio_packet_ms": tts_first_audio_packet_ms,
+            "asr_to_llm_first_token_ms": (
+                round(llm_first_token_ms - asr_end_ms, 1)
+                if asr_end_ms and llm_first_token_ms
+                else None
+            ),
+            "llm_first_token_to_tts_first_audio_ms": (
+                round(tts_first_audio_packet_ms - llm_first_token_ms, 1)
+                if llm_first_token_ms and tts_first_audio_packet_ms
+                else None
+            ),
+            "asr_to_tts_first_audio_ms": (
+                round(tts_first_audio_packet_ms - asr_end_ms, 1)
+                if asr_end_ms and tts_first_audio_packet_ms
+                else None
+            ),
+            "elapsed_since_asr_end_ms": (
+                round(now_ms - asr_end_ms, 1) if asr_end_ms else None
+            ),
+        },
+    }
 
 
 async def sendAudioMessage(conn: "ConnectionHandler", sentenceType, audios, text):
@@ -67,7 +117,8 @@ async def _wait_for_audio_completion(conn: "ConnectionHandler"):
         # 等待预缓冲包播放完成
         # 前N个包直接发送，增加2个网络抖动包，需要额外等待它们在客户端播放完成
         frame_duration_ms = rate_controller.frame_duration
-        pre_buffer_playback_time = (PRE_BUFFER_COUNT + 2) * frame_duration_ms / 1000.0
+        pre_buffer_count = _get_pre_buffer_count(conn)
+        pre_buffer_playback_time = (pre_buffer_count + 2) * frame_duration_ms / 1000.0
         await asyncio.sleep(pre_buffer_playback_time)
 
         conn.logger.bind(tag=TAG).debug("音频发送完成")
@@ -228,7 +279,8 @@ async def _send_audio_with_rate_control(
         conn.last_activity_time = time.time() * 1000
 
         # 预缓冲：前N个包直接发送
-        if flow_control["packet_count"] < PRE_BUFFER_COUNT:
+        pre_buffer_count = _get_pre_buffer_count(conn)
+        if flow_control["packet_count"] < pre_buffer_count:
             await _do_send_audio(conn, packet, flow_control)
         elif send_delay > 0:
             # 固定延迟模式
@@ -259,6 +311,30 @@ async def _do_send_audio(conn: "ConnectionHandler", opus_packet, flow_control):
     flow_control["packet_count"] = packet_index + 1
     flow_control["sequence"] = sequence + 1
 
+    # 首个音频包到达网络发送点，记录延迟链路
+    if packet_index == 0 and hasattr(conn, "latency_marks"):
+        now_ms = time.time() * 1000
+        if conn.latency_marks.get("tts_first_audio_packet_ms") is None:
+            conn.latency_marks["tts_first_audio_packet_ms"] = now_ms
+            llm_first_ms = conn.latency_marks.get("llm_first_token_ms")
+            if llm_first_ms:
+                conn.logger.bind(tag=TAG).info(
+                    f"[latency] llm_first_token_to_tts_first_audio_ms={now_ms - llm_first_ms:.1f}"
+                )
+            asr_end_ms = conn.latency_marks.get("asr_end_ms")
+            if asr_end_ms:
+                conn.logger.bind(tag=TAG).info(
+                    f"[latency] asr_to_tts_first_audio_ms={now_ms - asr_end_ms:.1f}"
+                )
+            try:
+                perf_message = _build_performance_payload(conn, "first_audio")
+                asyncio.create_task(conn.websocket.send(json.dumps(perf_message)))
+                enqueue_perf_report(
+                    conn, "first_audio", perf_message.get("metrics", {})
+                )
+            except Exception:
+                pass
+
 
 async def send_tts_message(conn: "ConnectionHandler", state, text=None):
     """发送 TTS 状态消息"""
@@ -284,6 +360,13 @@ async def send_tts_message(conn: "ConnectionHandler", state, text=None):
         conn.audio_rate_controller.stop_sending()
         # 清除服务端讲话状态
         conn.clearSpeakStatus()
+        # 前台页面展示最终性能指标
+        try:
+            perf_message = _build_performance_payload(conn, "final")
+            await conn.websocket.send(json.dumps(perf_message))
+            enqueue_perf_report(conn, "final", perf_message.get("metrics", {}))
+        except Exception as e:
+            conn.logger.bind(tag=TAG).warning(f"发送性能指标失败: {e}")
 
     # 发送消息到客户端
     await conn.websocket.send(json.dumps(message))

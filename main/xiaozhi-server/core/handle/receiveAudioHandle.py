@@ -90,6 +90,13 @@ async def startToChat(conn: "ConnectionHandler", text):
         # 如果意图已被处理，不再进行聊天
         return
 
+    # 记录语音输入到对话链路的进入时间，用于端到端延迟分析
+    conn.latency_marks = {
+        "asr_end_ms": time.time() * 1000,
+        "llm_first_token_ms": None,
+        "tts_first_audio_packet_ms": None,
+    }
+
     # 意图未被处理，继续常规聊天流程，使用实际文本内容
     await send_stt_message(conn, actual_text)
     conn.executor.submit(conn.chat, actual_text)

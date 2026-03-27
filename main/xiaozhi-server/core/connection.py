@@ -191,6 +191,31 @@ class ConnectionHandler:
         self.close_after_chat = False
         self.load_function_plugin = False
         self.intent_type = "nointent"
+        self.latency_marks = {}
+
+        # LLM->TTS 流式分片策略（可通过配置覆盖）
+        tts_sentence_mode = str(self.config.get("tts_sentence_mode", "natural")).lower()
+        self.tts_sentence_mode = (
+            "aggressive" if tts_sentence_mode == "aggressive" else "natural"
+        )
+        self.tts_force_flush_ms = int(
+            self.config.get(
+                "tts_force_flush_ms",
+                220 if self.tts_sentence_mode == "aggressive" else 0,
+            )
+        )
+        self.tts_first_chunk_min_chars = int(
+            self.config.get(
+                "tts_first_chunk_min_chars",
+                8 if self.tts_sentence_mode == "aggressive" else 16,
+            )
+        )
+        self.tts_chunk_min_chars = int(
+            self.config.get(
+                "tts_chunk_min_chars",
+                2 if self.tts_sentence_mode == "aggressive" else 6,
+            )
+        )
 
         self.timeout_seconds = (
                 int(self.config.get("close_connection_no_voice_time", 120)) + 60
@@ -930,6 +955,12 @@ class ConnectionHandler:
                     )
 
         response_message = []
+        tts_chunk_buffer = ""
+        tts_chunk_first_emit = True
+        tts_chunk_last_emit_ms = time.time() * 1000
+        stream_flush_punctuations = ("。", "？", "?", "！", "!", "；", ";", "：", ":", "\n")
+        if self.tts_sentence_mode == "aggressive":
+            stream_flush_punctuations += ("，", ",", "、", "~")
 
         # 如果有工具调用提醒，临时添加到对话中（标记为临时消息）
         if tool_call_reminder:
@@ -1004,15 +1035,54 @@ class ConnectionHandler:
 
                 if content is not None and len(content) > 0:
                     if not tool_call_flag:
-                        response_message.append(content)
-                        self.tts.tts_text_queue.put(
-                            TTSMessageDTO(
-                                sentence_id=self.sentence_id,
-                                sentence_type=SentenceType.MIDDLE,
-                                content_type=ContentType.TEXT,
-                                content_detail=content,
-                            )
+                        if (
+                            self.latency_marks
+                            and self.latency_marks.get("llm_first_token_ms") is None
+                            and content.strip()
+                        ):
+                            first_token_time = time.time() * 1000
+                            self.latency_marks["llm_first_token_ms"] = first_token_time
+                            asr_end_ms = self.latency_marks.get("asr_end_ms")
+                            if asr_end_ms:
+                                self.logger.bind(tag=TAG).info(
+                                    f"[latency] asr_to_llm_first_token_ms={first_token_time - asr_end_ms:.1f}"
+                                )
+
+                        tts_chunk_buffer += content
+                        stripped_chunk = tts_chunk_buffer.strip()
+                        now_ms = time.time() * 1000
+                        flush_by_timeout = (
+                            self.tts_sentence_mode == "aggressive"
+                            and self.tts_force_flush_ms > 0
+                            and (now_ms - tts_chunk_last_emit_ms) >= self.tts_force_flush_ms
                         )
+                        flush_by_punctuation = bool(
+                            stripped_chunk
+                            and stripped_chunk[-1] in stream_flush_punctuations
+                        )
+                        min_chars = (
+                            self.tts_first_chunk_min_chars
+                            if tts_chunk_first_emit
+                            else self.tts_chunk_min_chars
+                        )
+                        flush_by_min_chars = len(stripped_chunk) >= min_chars
+
+                        if (flush_by_punctuation and flush_by_min_chars) or (
+                            flush_by_timeout and flush_by_min_chars
+                        ):
+                            emit_content = tts_chunk_buffer
+                            tts_chunk_buffer = ""
+                            tts_chunk_first_emit = False
+                            tts_chunk_last_emit_ms = now_ms
+                            response_message.append(emit_content)
+                            self.tts.tts_text_queue.put(
+                                TTSMessageDTO(
+                                    sentence_id=self.sentence_id,
+                                    sentence_type=SentenceType.MIDDLE,
+                                    content_type=ContentType.TEXT,
+                                    content_detail=emit_content,
+                                )
+                            )
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"LLM stream processing error: {e}")
             self.tts.tts_text_queue.put(
@@ -1032,6 +1102,17 @@ class ConnectionHandler:
                     )
                 )
             return
+
+        if not tool_call_flag and tts_chunk_buffer.strip():
+            response_message.append(tts_chunk_buffer)
+            self.tts.tts_text_queue.put(
+                TTSMessageDTO(
+                    sentence_id=self.sentence_id,
+                    sentence_type=SentenceType.MIDDLE,
+                    content_type=ContentType.TEXT,
+                    content_detail=tts_chunk_buffer,
+                )
+            )
         # 处理function call
         if tool_call_flag:
             bHasError = False
@@ -1126,10 +1207,10 @@ class ConnectionHandler:
                     content_type=ContentType.ACTION,
                 )
             )
-            # 使用lambda延迟计算，只有在DEBUG级别时才执行get_llm_dialogue()
+            # 使用lambda延迟计算，只有在DEBUG级别时才执行
             self.logger.bind(tag=TAG).debug(
                 lambda: json.dumps(
-                    self.dialogue.get_llm_dialogue(), indent=4, ensure_ascii=False
+                    self._build_dialogue_debug_payload(), indent=4, ensure_ascii=False
                 )
             )
 
@@ -1144,6 +1225,44 @@ class ConnectionHandler:
                     self.logger.bind(tag=TAG).debug("已清理临时的工具调用提醒消息")
 
         return True
+
+    def _build_dialogue_debug_payload(self):
+        """构建对话历史调试数据，附带性能指标。"""
+        llm_dialogue = self.dialogue.get_llm_dialogue()
+        payload = {"dialogue": llm_dialogue}
+
+        marks = self.latency_marks if isinstance(self.latency_marks, dict) else {}
+        asr_end_ms = marks.get("asr_end_ms")
+        llm_first_token_ms = marks.get("llm_first_token_ms")
+        tts_first_audio_packet_ms = marks.get("tts_first_audio_packet_ms")
+        now_ms = time.time() * 1000
+
+        perf_metrics = {
+            "asr_end_ms": asr_end_ms,
+            "llm_first_token_ms": llm_first_token_ms,
+            "tts_first_audio_packet_ms": tts_first_audio_packet_ms,
+            "asr_to_llm_first_token_ms": (
+                round(llm_first_token_ms - asr_end_ms, 1)
+                if asr_end_ms and llm_first_token_ms
+                else None
+            ),
+            "llm_first_token_to_tts_first_audio_ms": (
+                round(tts_first_audio_packet_ms - llm_first_token_ms, 1)
+                if llm_first_token_ms and tts_first_audio_packet_ms
+                else None
+            ),
+            "asr_to_tts_first_audio_ms": (
+                round(tts_first_audio_packet_ms - asr_end_ms, 1)
+                if asr_end_ms and tts_first_audio_packet_ms
+                else None
+            ),
+            "elapsed_since_asr_end_ms": (
+                round(now_ms - asr_end_ms, 1) if asr_end_ms else None
+            ),
+        }
+
+        payload["performance"] = perf_metrics
+        return payload
 
     def _get_tool_summary(self, functions: list) -> str:
         """

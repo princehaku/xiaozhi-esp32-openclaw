@@ -158,3 +158,24 @@ def enqueue_asr_report(conn: "ConnectionHandler", text, opus_data):
             )
     except Exception as e:
         conn.logger.bind(tag=TAG).debug(f"加入ASR上报队列失败: {text}, {e}")
+
+
+def enqueue_perf_report(conn: "ConnectionHandler", stage: str, metrics: dict):
+    """将性能指标作为文本加入对话记录上报队列。"""
+    if not conn.read_config_from_api or conn.need_bind or not conn.report_tts_enable:
+        return
+    if conn.chat_history_conf == 0:
+        return
+
+    try:
+        metric_text = ", ".join(
+            f"{k}={v}"
+            for k, v in metrics.items()
+            if v is not None and k.endswith("_ms")
+        )
+        content = f"[PERF][{stage}] {metric_text}"
+        # 作为智能体文本记录上报（chat_type=2），不携带音频
+        conn.report_queue.put((2, content, None, int(time.time())))
+        conn.logger.bind(tag=TAG).debug(f"性能指标已加入上报队列: {content}")
+    except Exception as e:
+        conn.logger.bind(tag=TAG).debug(f"加入性能上报队列失败: {e}")

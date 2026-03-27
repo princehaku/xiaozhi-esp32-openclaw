@@ -135,11 +135,32 @@ export class WebSocketHandler {
             }
         } else if (message.type === 'mcp') {
             this.handleMCPMessage(message);
+        } else if (message.type === 'performance') {
+            this.handlePerformanceMessage(message);
         } else {
             log(`未知消息类型: ${message.type}`, 'info');
             if (this.onChatMessage) {
                 this.onChatMessage(`未知消息类型: ${message.type}\n${JSON.stringify(message, null, 2)}`, false);
             }
+        }
+    }
+
+    // 处理性能指标消息
+    handlePerformanceMessage(message) {
+        const stage = message.stage || 'unknown';
+        const metrics = message.metrics || {};
+        const fmt = (value) => (value === null || value === undefined ? '-' : `${value}ms`);
+        const perfText = [
+            `性能指标(${stage})`,
+            `ASR->LLM首token: ${fmt(metrics.asr_to_llm_first_token_ms)}`,
+            `LLM首token->TTS首音包: ${fmt(metrics.llm_first_token_to_tts_first_audio_ms)}`,
+            `ASR->TTS首音包: ${fmt(metrics.asr_to_tts_first_audio_ms)}`,
+            `距ASR结束已耗时: ${fmt(metrics.elapsed_since_asr_end_ms)}`,
+        ].join('\n');
+
+        log(perfText, 'info');
+        if (this.onChatMessage) {
+            this.onChatMessage(`📊 ${perfText.replace(/\n/g, '<br/>')}`, false);
         }
     }
 

@@ -1,6 +1,7 @@
 import os
 import re
 import uuid
+import time
 import queue
 import asyncio
 import threading
@@ -70,6 +71,21 @@ class TTSProviderBase(ABC):
         self.tts_stop_request = False
         self.processed_chars = 0
         self.is_first_sentence = True
+        self.last_segment_emit_ms = 0.0
+        self.last_buffer_update_ms = 0.0
+        mode = str(config.get("tts_sentence_mode", "natural")).lower()
+        self.tts_sentence_mode = "aggressive" if mode == "aggressive" else "natural"
+        self.tts_force_flush_ms = int(
+            config.get(
+                "tts_force_flush_ms", 220 if self.tts_sentence_mode == "aggressive" else 0
+            )
+        )
+        self.tts_first_chunk_min_chars = int(
+            config.get(
+                "tts_first_chunk_min_chars",
+                8 if self.tts_sentence_mode == "aggressive" else 16,
+            )
+        )
 
     def generate_filename(self, extension=".wav"):
         return os.path.join(
@@ -281,7 +297,8 @@ class TTSProviderBase(ABC):
     def tts_text_priority_thread(self):
         while not self.conn.stop_event.is_set():
             try:
-                message = self.tts_text_queue.get(timeout=1)
+                poll_timeout = 0.1 if self.tts_sentence_mode == "aggressive" else 1
+                message = self.tts_text_queue.get(timeout=poll_timeout)
                 if message.sentence_type == SentenceType.FIRST:
                     self.conn.client_abort = False
                 if self.conn.client_abort:
@@ -294,11 +311,16 @@ class TTSProviderBase(ABC):
                     self.tts_text_buff = []
                     self.is_first_sentence = True
                     self.tts_audio_first_sentence = True
+                    now_ms = time.time() * 1000
+                    self.last_segment_emit_ms = now_ms
+                    self.last_buffer_update_ms = now_ms
                 elif ContentType.TEXT == message.content_type:
                     self.tts_text_buff.append(message.content_detail)
+                    self.last_buffer_update_ms = time.time() * 1000
                     segment_text = self._get_segment_text()
                     if segment_text:
                         self.to_tts_stream(segment_text, opus_handler=self.handle_opus)
+                        self.last_segment_emit_ms = time.time() * 1000
                 elif ContentType.FILE == message.content_type:
                     self._process_remaining_text_stream(opus_handler=self.handle_opus)
                     tts_file = message.content_file
@@ -311,8 +333,27 @@ class TTSProviderBase(ABC):
                     self.tts_audio_queue.put(
                         (message.sentence_type, [], message.content_detail)
                     )
+                    self.last_segment_emit_ms = 0.0
+                    self.last_buffer_update_ms = 0.0
 
             except queue.Empty:
+                if (
+                    self.tts_sentence_mode == "aggressive"
+                    and self.tts_force_flush_ms > 0
+                    and self.tts_text_buff
+                ):
+                    now_ms = time.time() * 1000
+                    idle_ms = now_ms - self.last_buffer_update_ms
+                    wait_ms = now_ms - self.last_segment_emit_ms
+                    if (
+                        self.last_buffer_update_ms > 0
+                        and idle_ms >= self.tts_force_flush_ms
+                        and wait_ms >= self.tts_force_flush_ms
+                    ):
+                        segment_text = self._get_segment_text(force_flush=True)
+                        if segment_text:
+                            self.to_tts_stream(segment_text, opus_handler=self.handle_opus)
+                            self.last_segment_emit_ms = now_ms
                 continue
             except Exception as e:
                 logger.bind(tag=TAG).error(
@@ -388,7 +429,7 @@ class TTSProviderBase(ABC):
         if hasattr(self, "ws") and self.ws:
             await self.ws.close()
 
-    def _get_segment_text(self):
+    def _get_segment_text(self, force_flush=False):
         # 合并当前全部文本并处理未分割部分
         full_text = "".join(self.tts_text_buff)
         current_text = full_text[self.processed_chars :]  # 从未处理的位置开始
@@ -413,6 +454,12 @@ class TTSProviderBase(ABC):
             segment_text = textUtils.get_string_no_punctuation_or_emoji(
                 segment_text_raw
             )
+            if (
+                self.is_first_sentence
+                and segment_text
+                and len(segment_text.strip()) < self.tts_first_chunk_min_chars
+            ):
+                return None
             self.processed_chars += len(segment_text_raw)  # 更新已处理字符位置
 
             # 如果是第一句话，在找到第一个逗号后，将标志设置为False
@@ -424,6 +471,14 @@ class TTSProviderBase(ABC):
             segment_text = current_text
             self.is_first_sentence = True  # 重置标志
             return segment_text
+        elif force_flush and current_text:
+            segment_text = textUtils.get_string_no_punctuation_or_emoji(current_text)
+            if segment_text:
+                self.processed_chars += len(current_text)
+                if self.is_first_sentence:
+                    self.is_first_sentence = False
+                return segment_text
+            return None
         else:
             return None
 

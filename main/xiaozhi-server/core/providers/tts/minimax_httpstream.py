@@ -105,10 +105,17 @@ class TTSProvider(TTSProviderBase):
                     self.tts_text_buff = []
                     self.before_stop_play_files.clear()
                 elif ContentType.TEXT == message.content_type:
-                    self.tts_text_buff.append(message.content_detail)
-                    segment_text = self._get_segment_text()
-                    if segment_text:
-                        self.to_tts_single_stream(segment_text)
+                    if self.tts_sentence_mode == "aggressive":
+                        segment_text = textUtils.get_string_no_punctuation_or_emoji(
+                            message.content_detail
+                        )
+                        if segment_text:
+                            self.to_tts_single_stream(segment_text)
+                    else:
+                        self.tts_text_buff.append(message.content_detail)
+                        segment_text = self._get_segment_text()
+                        if segment_text:
+                            self.to_tts_single_stream(segment_text)
 
                 elif ContentType.FILE == message.content_type:
                     logger.bind(tag=TAG).info(

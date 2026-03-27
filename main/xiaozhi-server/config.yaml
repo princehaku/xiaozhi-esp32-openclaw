@@ -78,6 +78,16 @@ enable_websocket_ping: false
 #   0: 使用精确时间控制，严格匹配音频帧率（默认，运行时按音频帧率计算）
 #   > 0: 使用固定延迟（毫秒）发送，例如: 60
 tts_audio_send_delay: 0
+# TTS预缓冲包数量（前N包直接发送），更小可更快出声但可能更易抖动
+tts_pre_buffer_count: 5
+# LLM->TTS文本分段模式：natural（自然）/aggressive（极速）
+tts_sentence_mode: natural
+# aggressive模式下无标点强制flush时间（毫秒），0表示关闭
+tts_force_flush_ms: 220
+# 首段最小字符数，防止过短碎片导致语音抖动
+tts_first_chunk_min_chars: 8
+# 非首段最小字符数
+tts_chunk_min_chars: 2
 
 exit_commands:
   - "退出"
