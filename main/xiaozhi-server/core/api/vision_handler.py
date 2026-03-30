@@ -1,5 +1,8 @@
 import json
 import copy
+import os
+import time
+from pathlib import Path
 from aiohttp import web
 from config.logger import setup_logging
 from core.api.base_handler import BaseHandler
@@ -10,6 +13,9 @@ from core.utils.auth import AuthToken
 import base64
 from typing import Tuple, Optional
 from plugins_func.register import Action
+
+# 图片保存目录：项目根目录下的 docs/vision_images/
+_VISION_SAVE_DIR = Path(__file__).resolve().parents[4] / "docs" / "vision_images"
 
 TAG = __name__
 
@@ -99,6 +105,17 @@ class VisionHandler(BaseHandler):
 
             # 将图片转换为base64编码
             image_base64 = base64.b64encode(image_data).decode("utf-8")
+
+            # 将图片保存到 docs/vision_images/ 目录
+            try:
+                _VISION_SAVE_DIR.mkdir(parents=True, exist_ok=True)
+                ts = int(time.time() * 1000)
+                safe_device = (device_id or "unknown").replace("/", "_").replace("\\", "_")
+                save_path = _VISION_SAVE_DIR / f"{safe_device}_{ts}.jpg"
+                save_path.write_bytes(image_data)
+                self.logger.bind(tag=TAG).debug(f"图片已保存: {save_path}")
+            except Exception as save_err:
+                self.logger.bind(tag=TAG).warning(f"图片保存失败（不影响识别）: {save_err}")
 
             # 如果开启了智控台，则从智控台获取模型配置
             current_config = copy.deepcopy(self.config)
