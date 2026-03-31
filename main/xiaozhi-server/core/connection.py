@@ -930,7 +930,7 @@ class ConnectionHandler:
         if depth == 0 and query is not None and functions is not None:
             dialogue_length = len(self.dialogue.dialogue)
             # 当对话历史超过4条消息时，注入规则强化
-            if dialogue_length > 4:
+            if dialogue_length > 500:
                 tool_summary = self._get_tool_summary(functions)
                 if tool_summary:
                     # 根据对话长度和偷懒检测，使用不同强度的提醒
